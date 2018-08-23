@@ -1,0 +1,926 @@
+---
+title: "2nd Assignment: Pump it Up"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 1
+author: Ignacio Ruperez & Federico Garcia (team name Slowly). Ranking 255th. Score 0.8211
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+# Loading libraries
+
+```{r message=FALSE}
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(caret)
+library(e1071)
+library(googleVis)
+library(randomForest)
+library(lubridate)
+library(ranger)
+library(vtreat)
+library(magrittr)
+library(xgboost)
+library(h2o)
+```
+
+# Introduction
+
+The main goal is to predict, by using data from Taarifa and the Tanzanian Ministry of Water, which pumps are functional, which need some repairs, and which don't work at all
+
+The idea is to predict one of these three classes based on a number of variables about what kind of pump is operating, when it was installed, and how it is managed. A smart understanding of which water points will fail can improve maintenance operations and ensure that clean, potable water is available to communities across Tanzania.
+
+Vars description: https://www.drivendata.org/competitions/7/pump-it-up-data-mining-the-water-table/page/25/ 
+
+# Loading datasets
+
+```{r}
+
+train = read.csv("training_set_values.csv")
+test = read.csv("test_set_values.csv")
+labels = read.csv("training_set_labels.csv") # dependent variable
+
+```
+
+We combine train and test datasets into one total dataset
+
+```{r}
+total <- rbind(train, test)
+```
+
+# Feature engineering process
+
+Here we analyze every feature in the dataset and perform different actions: combination of features, elimination, imputation and creation of new features.
+
+## id
+
+They are unique identifiers, so we can delete the column
+
+```{r}
+total <- within(total, rm('id')) 
+```
+
+## amount_tsh: Total static head (amount water available to waterpoint)
+
+We can make 4 groups: zero, low, medium and high
+
+```{r}
+total$amount_tsh_group <- cut(total$amount_tsh, breaks = c(-Inf, 0, 100, 1000, Inf), labels = c("zero", "low", "medium", "high"))
+```
+
+## construction_year: Year the waterpoint was constructed
+
+```{r}
+table(total$construction_year)
+```
+
+We can calculate the number of years the well has:
+
+```{r}
+total <- total %>%
+  mutate(date_recorded = ymd(date_recorded)) %>%
+  mutate(operation_years = lubridate::year(date_recorded) - construction_year) %>%
+  mutate(operation_years = ifelse(operation_years < 0 | operation_years > 2000, -1, operation_years))
+```
+
+We can also create a new feature: top20_construction_year (this will be made for several features in order to reduce the number of levels)
+
+```{r}
+total$top20_construction_year <- factor(paste0("y",as.character(total$construction_year)))
+years <- names(summary(total$top20_construction_year)[order(-summary(total$top20_construction_year))][1:20])
+lyears <- factor(total$top20_construction_year, levels=c(years, "Other"))
+lyears[is.na(lyears)] <- "Other"
+total$top20_construction_year <- lyears
+```
+
+## date_recorded: The date the row was entered
+
+We can extract the month from this feature, as Tanzania has dry months and rainy months.
+
+```{r}
+total <- total %>%
+  mutate(month_recorded = lubridate::month(date_recorded))
+```
+
+We can then delete date_recorded, as it is not informative per se.
+
+```{r}
+total <- within(total, rm('date_recorded')) 
+```
+
+## funder: Who funded the well
+
+We can make 3 groups: government, unknown and other
+
+```{r}
+total$funder_group <- ifelse(total$funder == "" | total$funder == "0", "unknown", ifelse(grepl("gov",total$funder, ignore.case = TRUE), "government", "other"))
+total$funder_group <- as.factor(total$funder_group)
+
+levels(total$funder) <- c(levels(total$funder), "unknown") 
+total$funder[total$funder == ""]  <- "unknown"
+total$funder[total$funder == "0"]  <- "unknown"
+total$funder <- factor(total$funder)
+```
+
+We can also create another feature: top20_funders
+
+```{r}
+total$top20_funders <- factor(total$funder)
+funders <- names(summary(total$top20_funders)[order(-summary(total$top20_funders))][1:20])
+lfunders <- factor(total$top20_funders, levels=c(funders, "Other"))
+lfunders[is.na(lfunders)] <- "Other"
+total$top20_funders <- lfunders
+```
+
+## installer: Organization that installed the well
+
+We can make 3 groups: government, unknown and other
+
+```{r}
+levels(total$installer) <- tolower(levels(total$installer))
+
+total$installer_group <- ifelse(total$installer == "" | total$installer == "0" | total$installer == "-", "unknown", ifelse(grepl("gov",total$installer, ignore.case = TRUE), "government", "other"))
+total$installer_group <- as.factor(total$installer_group)
+
+levels(total$installer) <- c(levels(total$installer), "unknown") 
+total$installer[total$installer == ""]  <- "unknown"
+total$installer[total$installer == "0"]  <- "unknown"
+total$installer[total$installer == "-"]  <- "unknown"
+total$installer <- factor(total$installer)
+```
+
+We can also create another feature: top20_installers
+
+```{r}
+total$top20_installers <- factor(total$installer)
+installers <- names(summary(total$top20_installers)[order(-summary(total$top20_installers))][1:20])
+linstallers <- factor(total$top20_installers, levels=c(installers, "Other"))
+linstallers[is.na(linstallers)] <- "Other"
+total$top20_installers <- linstallers
+```
+
+## wpt_name: Name of the waterpoint if there is one
+
+```{r eval=FALSE}
+unique(total$wpt_name)
+
+# There are 45684 different names, so we delete this feature
+
+total <- within(total, rm('wpt_name')) 
+```
+
+## num_private: -
+
+There is no information about this feature. They are integer numbers from 0 to 1776. We can make 2 groups: zero and other
+
+```{r}
+total$num_private_group <- ifelse(total$num_private == 0, "zero", "other")
+total$num_private_group <- as.factor(total$num_private_group)
+```
+
+## basin: Geographic water basin
+
+```{r}
+table(total$basin)
+```
+
+We have 9 levels for this feature and no null values, so we leave as it is.
+
+## subvillage: Geographic location
+
+There are 470 blank values. We set them to unknown.
+
+```{r}
+levels(total$subvillage) <- c(levels(total$subvillage), "unknown") 
+total$subvillage[total$subvillage == ""]  <- "unknown" 
+total$subvillage <- factor(total$subvillage)
+```
+
+We can create another feature: top20_subvillages
+
+```{r}
+total$top20_subvillages <- factor(total$subvillage)
+subvillages <- names(summary(total$top20_subvillages)[order(-summary(total$top20_subvillages))][1:20])
+lsubvillages <- factor(total$top20_subvillages, levels=c(subvillages, "Other"))
+lsubvillages[is.na(lsubvillages)] <- "Other"
+total$top20_subvillages <- lsubvillages
+```
+
+## region: Geographic location
+
+```{r}
+table(total$region)
+```
+
+We have 21 levels for this feature and no null values, so we leave as it is.
+
+## region_code: Geographic location (coded)
+
+```{r}
+table(total$region_code, total$region)
+```
+
+There are some regions with more than one code, and some codes with more than one region, so we remove this feature.
+
+```{r}
+total <- within(total, rm('region_code')) 
+```
+
+## district_code: Geographic location (coded)
+
+```{r}
+table(total$region, total$district_code)
+```
+
+The distric_code only makes sense if it's attached to the region name (one code is shared among several regions), so we create a column for both features together:
+
+```{r}
+district <- paste(total$region, total$district_code, sep = "_")
+total$district <- district
+total$district <- as.factor(total$district)
+```
+
+We can also create another feature: top20_districts:
+
+```{r}
+total$top20_districts <- factor(total$district)
+districts <- names(summary(total$top20_districts)[order(-summary(total$top20_districts))][1:20])
+ldistricts <- factor(total$top20_districts, levels=c(districts, "Other"))
+ldistricts[is.na(ldistricts)] <- "Other"
+total$top20_districts <- ldistricts
+```
+
+## longitude and latitude: GPS coordinates
+
+Let's check if all the coordinates are inside the country of Tanzania
+
+```{r}
+ggplot(total,
+    aes(x = longitude, y = latitude)) + 
+    geom_point(shape = 16) + 
+    theme(legend.position = "top")
+
+```
+
+There are several points with (0,0) coordinates. If we filter them, we can obtain a better plot:
+
+```{r}
+ggplot(subset(total, longitude > 0.1 & latitude < -0.1),
+    aes(x = longitude, y = latitude)) + 
+    geom_point(shape = 16) + 
+    theme(legend.position = "top") + 
+    coord_fixed()
+```
+
+We can impute (0,0) coordinates with the average coordinates for the same district:
+
+```{r}
+total <- total %>%
+  mutate(latitude = ifelse(latitude > -0.1, NA, latitude)) %>%
+  mutate(longitude = ifelse(longitude < 0.1, NA, longitude))
+
+total <- total %>% 
+  group_by(district) %>%
+  mutate(district_long = mean(longitude, na.rm = TRUE)) %>%
+  mutate(district_lat = mean(latitude, na.rm = TRUE)) %>%
+  ungroup()
+
+total <- total %>%
+  group_by(region) %>%
+  mutate(region_long = mean(longitude, na.rm = TRUE)) %>%
+  mutate(region_lat = mean(latitude, na.rm = TRUE)) %>%
+  ungroup()
+
+total <- total %>%
+  mutate(longitude = ifelse(!is.na(longitude), longitude, ifelse(!is.na(district_long), district_long, region_long))) %>%
+  mutate(latitude = ifelse(!is.na(latitude), latitude, ifelse(!is.na(district_lat), district_lat, region_lat)))
+```
+
+Besides, we can divide the map in a grid of 20x20 and assign each coordinate to its corresponding area.
+
+```{r}
+maxlong <- max(total$longitude)
+minlong <- min(total$longitude[which(total$longitude > 0.1)])
+maxlat <- max(total$latitude[which(total$latitude < -0.1)])
+minlat <- min(total$latitude)
+
+gridlong <- cut(total$longitude, breaks = seq(minlong, maxlong, (maxlong-minlong)/20), labels = LETTERS[seq( from = 1, to = 20 )])
+gridlong2 <- addNA(gridlong)
+levels(gridlong2) <- c(levels(gridlong), "X")
+
+gridlat <- cut(total$latitude, breaks = seq(minlat, maxlat, (maxlat-minlat)/20), labels = LETTERS[seq( from = 1, to = 20 )])
+gridlat2 <- addNA(gridlat)
+levels(gridlat2) <- c(levels(gridlat), "X")
+
+gridcoor <- paste0(gridlat2, gridlong2)
+total$gridcoor <- gridcoor
+total$gridcoor <- as.factor(total$gridcoor)
+```
+
+We can create another feature: top20_gridcoors
+
+```{r}
+total$top20_gridcoors <- factor(total$gridcoor)
+gridcoors <- names(summary(total$top20_gridcoors)[order(-summary(total$top20_gridcoors))][1:20])
+lgridcoors <- factor(total$top20_gridcoors, levels=c(gridcoors, "Other"))
+lgridcoors[is.na(lgridcoors)] <- "Other"
+total$top20_gridcoors <- lgridcoors
+```
+
+## gps_height: Altitude of the well
+
+There are lots of missing values in this feature. We think that just imputing the mean or median from the same region is not a good idea, as a single region can have very high and very low areas.
+
+To check if gps_heights are correctly stored in the dataset and to impute blank heights, we have used the Google Elevation API: https://developers.google.com/maps/documentation/elevation/start
+
+```{r eval=FALSE}
+altitudes <- vector()
+
+for(i in 1:length(total$longitude)){
+  altitude <- elevation(latlong=list(c(total$latitude[i],total$longitude[i])), key = "YourAPIKey")
+  altitudes <- c(altitudes, altitude$elevation)
+}
+
+write.table(altitudes, file="altitudes.csv", row.names = FALSE, col.names = FALSE)
+```
+
+![Google Elevation API](02.png)
+
+We have obtained a csv file with the correct height for all the wells.
+
+```{r}
+altitude <- read.csv("altitudes.csv", header = FALSE, check.names = FALSE) # obtained from Google Elevation API
+
+total$altitude <- altitude$V1
+
+# We can plot our altitudes from Google with gps_height to see the difference
+
+plot(total$altitude, total$gps_height)
+```
+We can see that there are some incorrect heights in the dataset, as well as plenty of NAs, so adding calculated altitudes from Google Elevation API have solved this problem.
+
+## lga: Geographic location
+
+```{r}
+table(total$lga)
+```
+
+We can make 3 groups: urban, rural and other:
+
+```{r}
+total$lga_group <- ifelse(grepl("urban", total$lga, ignore.case = TRUE), "urban", ifelse(grepl("rural", total$lga, ignore.case = TRUE), "rural", "other"))
+total$lga_group <- as.factor(total$lga_group)
+```
+
+We can also create another feature: top20_lgas
+
+```{r}
+total$top20_lgas <- factor(total$lga)
+lgas <- names(summary(total$top20_lgas)[order(-summary(total$top20_lgas))][1:20])
+llgas <- factor(total$top20_lgas, levels=c(lgas, "Other"))
+llgas[is.na(llgas)] <- "Other"
+total$top20_lgas <- llgas
+```
+
+## ward: Geographic location
+
+```{r eval=FALSE}
+table(total$ward)
+```
+
+We can create another feature: top20_wards
+
+```{r}
+total$top20_wards <- factor(total$ward)
+wards <- names(summary(total$top20_wards)[order(-summary(total$top20_wards))][1:20])
+lwards <- factor(total$top20_wards, levels=c(wards, "Other"))
+lwards[is.na(lwards)] <- "Other"
+total$top20_wards <- lwards
+```
+
+## population: Population around the well
+
+We can make 2 groups: zero or non-zero
+
+```{r}
+total$population_group <- ifelse(total$population == 0, "zero", "non-zero")
+total$population_group <- as.factor(total$population_group)
+```
+
+## public_meeting: True/False
+
+We fill NA values with "unknown"
+
+```{r}
+levels(total$public_meeting) <- c(levels(total$public_meeting), "unknown") 
+total$public_meeting[total$public_meeting == ""]  <- "unknown"
+total$public_meeting <- factor(total$public_meeting)
+```
+
+## recorded_by: Group entering this row of data
+
+```{r}
+table(total$recorded_by)
+```
+
+Only one value, so we remove the feature:
+
+```{r}
+total <- within(total, rm('recorded_by')) 
+```
+
+## scheme_management: Who operates the waterpoint
+
+We fill NA values with "unknown"
+
+```{r}
+levels(total$scheme_management) <- c(levels(total$scheme_management), "unknown") 
+total$scheme_management[total$scheme_management == ""]  <- "unknown"
+total$scheme_management <- factor(total$scheme_management)
+```
+
+## scheme_name: Who operates the waterpoint
+
+We fill NA values with "unknown" and make 4 groups: government, none, other and unknown
+
+```{r}
+levels(total$scheme_name) <- tolower(levels(total$scheme_name))
+
+total$scheme_name_group <- ifelse(total$scheme_name == "", "unknown", ifelse(grepl("gov",total$scheme_name, ignore.case = TRUE), "government", ifelse(total$scheme_name == "None", "none", "other")))
+total$scheme_name_group <- as.factor(total$scheme_name_group)
+
+levels(total$scheme_name) <- c(levels(total$scheme_name), "unknown") 
+total$scheme_name[total$scheme_name == ""]  <- "unknown"
+total$scheme_name <- factor(total$scheme_name)
+```
+
+We can create another feature: top20_scheme_names
+
+```{r}
+total$top20_scheme_names <- factor(total$scheme_name)
+scheme_names <- names(summary(total$top20_scheme_names)[order(-summary(total$top20_scheme_names))][1:20])
+lscheme_names <- factor(total$top20_scheme_names, levels=c(scheme_names, "Other"))
+lscheme_names[is.na(lscheme_names)] <- "Other"
+total$top20_scheme_names <- lscheme_names
+```
+
+## permit: If the waterpoint is permitted
+
+We fill NA values with "unknown"
+
+```{r}
+levels(total$permit) <- c(levels(total$permit), "unknown") 
+total$permit[total$permit == ""]  <- "unknown"
+total$permit <- factor(total$permit)
+```
+
+## extraction_type: The kind of extraction the waterpoint uses
+
+```{r}
+table(total$extraction_type)
+```
+
+We leave it as it is
+
+## extraction_type_group: The kind of extraction the waterpoint uses
+
+```{r}
+table(total$extraction_type_group)
+```
+
+It is very similar to the previous feature, but we leave it in case the slight differences are significant.
+
+## extraction_type_class: The kind of extraction the waterpoint uses
+
+```{r}
+table(total$extraction_type_class)
+```
+
+We leave as it is.
+
+## management: How the waterpoint is managed
+
+```{r}
+table(total$management)
+```
+
+We leave it as it is.
+
+## management_group: How the waterpoint is managed
+
+```{r}
+table(total$management_group)
+```
+
+We leave it as it is.
+
+## payment: What the water costs
+
+```{r}
+table(total$payment)
+```
+
+We leave it as it is.
+
+## payment_type: What the water costs
+
+```{r}
+table(total$payment_type)
+```
+
+It is the same data as the previuos feature. We can remove "payment":
+
+```{r}
+total <- within(total, rm('payment')) 
+```
+
+## water_quality: The quality of the water
+
+```{r}
+table(total$water_quality)
+```
+
+We leave it as it is.
+
+## quality_group: The quality of the water
+
+```{r}
+table(total$quality_group)
+```
+
+We leave it as it is.
+
+## quantity: The quantity of water
+
+```{r}
+table(total$quantity)
+```
+ 
+We leave it as it is.
+
+## quantity_group: The quantity of water
+
+
+```{r}
+table(total$quantity_group)
+```
+
+It is the same data as the previuos feature. We can remove "quantity_group":
+
+```{r}
+total <- within(total, rm('quantity_group')) 
+```
+
+## source: The source of the water
+
+```{r}
+table(total$source)
+```
+We leave it as it is
+
+## source_type: The source of the water
+
+```{r}
+table(total$source_type)
+```
+We leave it as it is
+
+## source_class: The source of the water
+
+```{r}
+table(total$source_class)
+```
+We leave it as it is
+
+## waterpoint_type: The kind of waterpoint
+
+```{r}
+table(total$waterpoint_type)
+```
+We leave it as it is
+
+## waterpoint_type_group: The kind of waterpoint
+
+```{r}
+table(total$waterpoint_type_group)
+```
+We leave it as it is
+
+## Removing useless generated features
+
+```{r}
+total <- within(total, rm('district_long'))
+total <- within(total, rm('district_lat'))
+total <- within(total, rm('region_long'))
+total <- within(total, rm('region_lat'))
+```
+
+# Training and test separation
+
+```{r}
+training_data = cbind(total[1:59400,], labels["status_group"])
+test_data = cbind(test["id"], total[59401:74250,])
+```
+
+# Models
+
+Here we run several models to check which one performs better
+
+## Random Forest
+
+First, we run the basic Random Forest algorithm with all the features and a few trees to see which features are not important and remove them.
+
+```{r}
+set.seed(42)
+
+model_forest <- randomForest(as.factor(status_group) ~ amount_tsh + top20_funders + gps_height + top20_installers + longitude + latitude + num_private + basin + top20_subvillages + region + district_code + top20_lgas + top20_wards + population + public_meeting + scheme_management + top20_scheme_names + permit + construction_year + extraction_type + extraction_type_group + extraction_type_class + management + management_group + payment_type + water_quality + quality_group + quantity + source + source_type + source_class + waterpoint_type + waterpoint_type_group + amount_tsh_group + operation_years + top20_construction_year + month_recorded + funder_group + installer_group + num_private_group + top20_districts + top20_gridcoors + altitude + lga_group + population_group + scheme_name_group, data = training_data, na.action=na.omit, importance = TRUE, ntree = 5, nodesize = 1)
+
+pred_forest_train <- predict(model_forest, training_data)
+
+confusionMatrix(pred_forest_train, training_data$status_group)
+
+randomForest::importance(model_forest)
+
+varImpPlot(model_forest)
+```
+
+We remove the least important feature according to its MeanDecreaseAccuracy and run/remove features again and again until accuracy reaches a maximum. 
+
+Once we have the most important features, we can perform several Random Forest with different combinations of seeds (from 1 to 10), number of trees (100, 200 and 500) and node sizes (from 1 to 5) to see which combination performs better in terms of accuracy (total number of Random Forests: 150)
+
+```{r eval=FALSE}
+forest <- function(seed, ntree, nodesize){
+  set.seed(seed)
+  model_forest <- randomForest(as.factor(status_group) ~ gps_height + longitude + latitude + basin + region + district_code + population + public_meeting + scheme_management + permit + construction_year + extraction_type + extraction_type_group + management_group + payment_type + water_quality + quality_group + quantity + source + source_type + waterpoint_type + funder_group + installer_group + altitude + scheme_name_group, data = training_data, ntree = ntree, nodesize = nodesize)
+  
+  pred_forest_train <- predict(model_forest, training_data)
+  
+  confmat <- confusionMatrix(pred_forest_train, training_data$status_group)
+  
+  new_line <- c(seed, ntree, nodesize, confmat$overall[1])
+  results <- rbind(results, new_line, stringsAsFactors = FALSE)
+}
+
+results <- data.frame(matrix(ncol = 4, nrow = 0))
+
+combs <- expand.grid(1:10, c(100, 200, 500), 1:5)
+seedv <- combs[,1]
+ntreev <- combs[,2]
+nodesizev <- combs[,3]
+
+result <- mapply(forest, seedv, ntreev, nodesizev)
+
+df <- data.frame(matrix(unlist(result), nrow=150, byrow=T),stringsAsFactors=FALSE)
+```
+
+The highest accuracy is achieved with the following parameters:
+- seed: 6
+- ntrees: 500
+- nodesize: 1
+
+```{r eval=FALSE}
+set.seed(6)
+
+model_forest <- randomForest(as.factor(status_group) ~ gps_height + longitude + latitude + basin + region + district_code + population + public_meeting + scheme_management + permit + construction_year + extraction_type + extraction_type_group + management_group + payment_type + water_quality + quality_group + quantity + source + source_type + waterpoint_type + funder_group + installer_group + altitude + scheme_name_group, data = training_data, importance = TRUE, ntree = 500, nodesize = 1)
+
+pred_forest_train <- predict(model_forest, training_data)
+
+confusionMatrix(pred_forest_train, training_data$status_group)
+
+randomForest::importance(model_forest)
+
+varImpPlot(model_forest)
+
+```
+
+The accuracy for this Random Forest is 0.959.
+
+We can now make the predictions on the test dataset and obtain the submission file.
+
+```{r eval=FALSE}
+pred_forest_test <- predict(model_forest, test_data)
+
+submission <- data.frame(test_data$id)
+submission$status_group <- pred_forest_test
+names(submission)[1] <- "id"
+
+write.csv(submission, file = "submit.csv", row.names = FALSE)
+```
+
+With this Random Forest model, the score in the competition is 0.8178 (397th in ranking).
+
+## Random Forest with Ranger package
+
+This is another package to perform Random Forest algorithm. We have performed several Random Forest with different combinations of seeds (from 1 to 10) and number of trees (500, 1000 and 2000) to see which combination performs better in terms of accuracy (total number of Random Forests: 30). The highest accuracy is achieved with the following parameters:
+- seed: 10
+- ntrees: 2000
+
+![Errors for different combinations seed/ntrees](03.png)
+
+```{r eval=FALSE}
+set.seed(10)
+
+model_ranger <- ranger(as.factor(status_group) ~ gps_height + longitude + latitude + basin + region + district_code + population + public_meeting + scheme_management + permit + construction_year + extraction_type + extraction_type_group + management_group + payment_type + water_quality + quality_group + quantity + source + source_type + waterpoint_type + funder_group + installer_group + altitude + scheme_name_group, data = training_data, importance = 'impurity', num.trees = 2000, respect.unordered.factors = "order")
+
+pred_ranger_train <- predict(model_ranger, training_data)
+
+importance(model_ranger)
+
+pred_ranger_test <- predict(model_ranger, test_data)
+
+submission <- data.frame(test_data$id)
+submission$status_group <- pred_ranger_test$predictions
+names(submission)[1] <- "id"
+
+write.csv(submission, file = "submit.csv", row.names = FALSE)
+```
+
+Submitting this Random Forest with ranger package gives us a score of 0.8170 in the competition (a little bit worse than before)
+
+## XGBoost
+
+Here we run a XGBoost model with cross validation
+
+```{r eval=FALSE}
+outcome <- "status_group"
+
+vars <- colnames(total)
+
+treatplan <- designTreatmentsZ(training_data, vars, verbose = FALSE)
+
+newvars <- treatplan %>%
+  use_series(scoreFrame) %>%        
+  filter(code %in% c("clean", "lev")) %>% 
+  use_series(varName)         
+
+training.treat <- prepare(treatplan, training_data,  varRestriction = newvars)
+
+test.treat <- prepare(treatplan, test_data, varRestriction = newvars)
+
+str(training.treat) 
+str(test.treat)
+
+labels$status_group_num <- ifelse(labels$status_group == "non functional", 0, ifelse(labels$status_group == "functional needs repair", 1, 2))
+
+# Cross validation
+cv <- xgb.cv(data = as.matrix(training.treat), 
+            label = labels$status_group_num,
+            nrounds = 400,
+            nfold = 5,
+            objective = "multi:softmax",
+            num_class = 3,
+            eta = 0.3,
+            max_depth = 6,
+            early_stopping_rounds = 10,
+            verbose = 0  
+)
+
+elog <- cv$evaluation_log
+
+ntrees <- elog %>% 
+   summarize(ntrees.train = which.min(train_merror_mean),
+             ntrees.test  = which.min(test_merror_mean))  
+
+ntrees <- ntrees$ntrees.test
+
+# Xgboost
+model_xgb <- xgboost(data = as.matrix(training.treat), 
+                   label = labels$status_group_num, 
+                   nrounds = ntrees,      
+                   objective = "multi:softmax",
+                   num_class = 3,
+                   eta = 0.3,
+                   depth = 6,
+                   verbose = 0
+)
+
+test_data$pred <- predict(model_xgb, as.matrix(test.treat))
+
+test_data$status_group <- ifelse(test_data$pred == 0, "non functional", ifelse(test_data$pred == 1, "functional needs repair", "functional"))
+
+submission <- data.frame(test_data$id)
+submission$status_group <- test_data$status_group
+names(submission)[1] <- "id"
+
+write.csv(submission, file = "submit.csv", row.names = FALSE)
+
+```
+
+This XGBoost model gives us a score of 0.8131 in the competition (again a bit worse than before)
+
+## Naïve Bayes
+
+Here we run the Naïve Bayes classification model with all the features.
+
+```{r eval=FALSE}
+test_data = cbind(test["id"], total[59401:74250,])
+
+model_naive <- naiveBayes(status_group ~ ., data = training_data)
+
+pred_naive <- predict(model_naive, test_data)
+table(pred_naive)
+
+submission <- data.frame(test_data$id)
+submission$status_group <- pred_naive
+names(submission)[1] <- "id"
+
+write.csv(submission, file = "submit.csv", row.names = FALSE)
+```
+
+This Naïve Bayes model gives us a score of 0.5463 (extremely bad).
+
+## H2O Random Forest
+
+We use now H2O clusters to perform the Random Forest Algorithm.
+
+```{r eval=FALSE}
+localH2O = h2o.init()
+
+target = "status_group"
+test_data = cbind(test["id"], total[59401:74250,])
+
+trainHex = as.h2o(training_data, destination_frame = "train.hex")
+testHex = as.h2o(test_data, destination_frame = "test.hex")
+
+vars <- colnames(total)
+
+rfHex = h2o.randomForest(
+  x = vars,
+  y = target,
+  training_frame = trainHex,
+  model_id = "rf_ntrees1000",
+  ntrees = 1000, 
+  mtries = 10,
+  seed = 1)
+
+h2o.confusionMatrix(rfHex)
+
+pred_h2orf = as.data.frame(h2o.predict(rfHex,testHex))[,1]
+
+submission <- data.frame(test_data$id)
+submission$status_group <- pred_h2orf
+names(submission)[1] <- "id"
+
+write.csv(submission, file = "submit.csv", row.names = FALSE)
+
+h2o.shutdown(prompt = TRUE)
+
+```
+
+This H2O Random Forest model gives us a score of 0.8211 (255th in the rank).
+
+![H2O Cluster information](01.png)
+
+## H2O Random Forest with cross validation
+
+We run again the same model but with cross validation (nfold = 5).
+
+```{r eval=FALSE}
+
+localH2O = h2o.init(min_mem_size='1G', max_mem_size='10G')
+
+target = "status_group"
+test_data = cbind(test["id"], total[59401:74250,])
+
+trainHex = as.h2o(training_data, destination_frame = "train.hex")
+testHex = as.h2o(test_data, destination_frame = "test.hex")
+
+vars <- colnames(total)
+
+rfHex = h2o.randomForest(
+  x = vars,
+  y = target,
+  training_frame = trainHex,
+  model_id = "rf_ntrees1000",
+  ntrees = 1000, 
+  mtries = 10,
+  seed = 1,
+  nfolds = 5,
+  stopping_rounds = 5)
+
+h2o.confusionMatrix(rfHex)
+
+pred_h2orf = as.data.frame(h2o.predict(rfHex,testHex))[,1]
+
+submission <- data.frame(test_data$id)
+submission$status_group <- pred_h2orf
+names(submission)[1] <- "id"
+
+write.csv(submission, file = "submit.csv", row.names = FALSE)
+
+h2o.shutdown(prompt = TRUE)
+
+```
+
+This H2O Random Forest with cross-validation gives us a score of 0.8209 in the competition (slightly worse than before).
+
+
+
+
+
+
